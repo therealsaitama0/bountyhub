@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/smtp"
@@ -10,17 +11,21 @@ import (
 	"time"
 )
 
-// StartCronScheduler runs a background goroutine syncing bounties at the scheduled time daily
+// StartCronScheduler runs a background goroutine syncing bounties and sending notifications/digests
 func StartCronScheduler() {
 	// Sync immediately on startup in a separate goroutine
 	go func() {
 		log.Println("Running startup bounty sync...")
-		if err := SyncAndSendDigest(); err != nil {
-			log.Printf("Startup sync error: %v", err)
+		var settings UserSetting
+		if err := DB.First(&settings).Error; err == nil {
+			_, err := SyncBounties(&settings)
+			if err != nil {
+				log.Printf("Startup sync error: %v", err)
+			}
 		}
 	}()
 
-	// Check settings every 1 minute to trigger digest email on time
+	// Check settings/times every 1 minute
 	ticker := time.NewTicker(1 * time.Minute)
 	var lastSentDay string
 	go func() {
@@ -30,55 +35,104 @@ func StartCronScheduler() {
 				continue
 			}
 
+			now := time.Now()
+
+			// 1. Check if it's time to Sync from GitHub
+			intervalMins := settings.SyncIntervalMins
+			if intervalMins <= 0 {
+				intervalMins = 60 // Default to 60 minutes if invalid
+			}
+			
+			// Sync if last synced is longer ago than interval (or if never synced before)
+			if settings.LastSyncedAt.IsZero() || now.Sub(settings.LastSyncedAt) >= (time.Duration(intervalMins)*time.Minute) {
+				log.Printf("Sync interval (%d mins) elapsed. Starting sync...", intervalMins)
+				newBounties, err := SyncBounties(&settings)
+				if err != nil {
+					log.Printf("Periodic sync error: %v", err)
+				} else if len(newBounties) > 0 {
+					// Check if we should send instant notifications
+					if settings.NotificationMode == "instant" || settings.NotificationMode == "both" {
+						if IsInQuietHours(now, settings.QuietHoursStart, settings.QuietHoursEnd) {
+							log.Printf("Found %d new bounties, but quiet hours are active (%s - %s). Suppressing instant notification.", len(newBounties), settings.QuietHoursStart, settings.QuietHoursEnd)
+						} else {
+							log.Printf("Found %d new bounties. Sending instant notification...", len(newBounties))
+							subject := fmt.Sprintf("BountyHub Alert: %d New Bounty/Bounties Found", len(newBounties))
+							heading := "Instant Bounty Alert"
+							intro := fmt.Sprintf("We found <strong>%d</strong> new bounties matching your stack preferences just now.", len(newBounties))
+							err := SendEmailNotification(settings, newBounties, subject, heading, intro)
+							if err != nil {
+								log.Printf("Failed to send instant notification: %v", err)
+							}
+						}
+					}
+				}
+			}
+
+			// 2. Check if it's time to send Daily Digest
 			digestTime := settings.DigestTime
 			if digestTime == "" {
 				digestTime = "09:00"
 			}
 
-			now := time.Now()
 			currentTimeStr := now.Format("15:04")
 			currentDayStr := now.Format("2006-01-02")
 
 			if currentTimeStr == digestTime && lastSentDay != currentDayStr {
-				log.Printf("Scheduled digest time reached (%s). Starting sync and digest...", digestTime)
-				lastSentDay = currentDayStr
-				if err := SyncAndSendDigest(); err != nil {
-					log.Printf("Scheduled digest sync error: %v", err)
+				if settings.NotificationMode == "digest" || settings.NotificationMode == "both" {
+					log.Printf("Scheduled digest time reached (%s). Accumulating digest...", digestTime)
+					
+					// Find all bounties matching user filters created/added in the last 24 hours
+					var issues []BountyIssue
+					yesterday := now.Add(-24 * time.Hour)
+					err := DB.Where("created_at > ?", yesterday).Order("created_at DESC").Find(&issues).Error
+					if err != nil {
+						log.Printf("Failed to fetch digest issues: %v", err)
+						continue
+					}
+
+					var matchingIssues []BountyIssue
+					for _, iss := range issues {
+						if IsBountyMatch(iss, settings) {
+							matchingIssues = append(matchingIssues, iss)
+						}
+					}
+
+					if len(matchingIssues) > 0 {
+						subject := fmt.Sprintf("BountyHub Digest: %d New Bounties Discovered Today", len(matchingIssues))
+						heading := "Daily Bounty Digest"
+						intro := fmt.Sprintf("We summarized <strong>%d</strong> matching bounties for you today.", len(matchingIssues))
+						err := SendEmailNotification(settings, matchingIssues, subject, heading, intro)
+						if err != nil {
+							log.Printf("Failed to send digest email: %v", err)
+						} else {
+							lastSentDay = currentDayStr
+						}
+					} else {
+						log.Println("No new bounties found in last 24h for daily digest. Skipping digest email.")
+						lastSentDay = currentDayStr // Prevent re-triggering within the same minute
+					}
 				}
 			}
 		}
 	}()
 }
 
-// SyncAndSendDigest fetches latest bounties from GitHub, caches them in SQLite, and emails new ones
-func SyncAndSendDigest() error {
-	var settings UserSetting
-	if err := DB.First(&settings).Error; err != nil {
-		return fmt.Errorf("failed to fetch user settings: %w", err)
-	}
-
-	// Fetch bounties from GitHub using user stored token (or system env GITHUB_PAT)
+// SyncBounties fetches latest bounties from GitHub and caches them in SQLite
+func SyncBounties(settings *UserSetting) ([]BountyIssue, error) {
 	token := settings.GithubToken
-	if token == "" {
-		// Fallback to system env variable
-		// We'll read from main config or environment later
-	}
-
 	issues, err := FetchGitHubBounties(token)
 	if err != nil {
-		return fmt.Errorf("failed to fetch from github: %w", err)
+		return nil, fmt.Errorf("failed to fetch from github: %w", err)
 	}
 
-	// Insert/Update issues, and track which ones are newly created/inserted
 	var newBounties []BountyIssue
 	for _, iss := range issues {
 		var existing BountyIssue
 		res := DB.Where("github_issue_id = ?", iss.GithubIssueID).First(&existing)
 		if res.Error != nil {
-			// This is a new bounty we haven't seen in the DB
+			// Brand new bounty
 			if err := DB.Create(&iss).Error; err == nil {
-				// Apply filters to decide if it goes in email
-				if IsBountyMatch(iss, settings) {
+				if IsBountyMatch(iss, *settings) {
 					newBounties = append(newBounties, iss)
 				}
 			}
@@ -95,18 +149,61 @@ func SyncAndSendDigest() error {
 		}
 	}
 
-	log.Printf("Sync completed. Cached %d issues, found %d new ones matching user filters.", len(issues), len(newBounties))
+	// Update last synced time
+	settings.LastSyncedAt = time.Now()
+	DB.Save(settings)
 
-	// Send email digest if we have new matching issues and SMTP is configured
+	log.Printf("Sync completed. Checked %d issues, found %d new ones matching user filters.", len(issues), len(newBounties))
+	return newBounties, nil
+}
+
+// SyncAndSendDigest forces a sync and triggers a digest immediately (manual trigger)
+func SyncAndSendDigest() error {
+	var settings UserSetting
+	if err := DB.First(&settings).Error; err != nil {
+		return fmt.Errorf("failed to fetch user settings: %w", err)
+	}
+
+	newBounties, err := SyncBounties(&settings)
+	if err != nil {
+		return err
+	}
+
+	// For manual sync, send email immediately if any new ones found
 	if len(newBounties) > 0 && settings.Email != "" && (settings.SMTPHost != "" || os.Getenv("SMTP_HOST") != "") {
-		err := SendEmailDigest(settings, newBounties)
-		if err != nil {
-			log.Printf("SMTP email send failure: %v", err)
-			return err
-		}
+		subject := fmt.Sprintf("BountyHub Sync: %d New Bounties Found", len(newBounties))
+		heading := "Manual Sync Alert"
+		intro := fmt.Sprintf("We found <strong>%d</strong> new bounties matching your stack preferences during manual sync.", len(newBounties))
+		return SendEmailNotification(settings, newBounties, subject, heading, intro)
 	}
 
 	return nil
+}
+
+// IsInQuietHours checks if current time falls within user quiet hours (HH:MM format)
+func IsInQuietHours(now time.Time, startStr, endStr string) bool {
+	if startStr == "" || endStr == "" {
+		return false
+	}
+	t, err := time.Parse("15:04", now.Format("15:04"))
+	if err != nil {
+		return false
+	}
+	start, err := time.Parse("15:04", startStr)
+	if err != nil {
+		return false
+	}
+	end, err := time.Parse("15:04", endStr)
+	if err != nil {
+		return false
+	}
+
+	if start.Before(end) {
+		return !t.Before(start) && !t.After(end)
+	} else {
+		// Overlap midnight (e.g. 22:00 to 08:00)
+		return !t.Before(start) || !t.After(end)
+	}
 }
 
 // IsBountyMatch filters bounties based on user settings
@@ -140,13 +237,14 @@ func IsBountyMatch(bounty BountyIssue, settings UserSetting) bool {
 	return true
 }
 
-// SendEmailDigest constructs and sends HTML email
-func SendEmailDigest(settings UserSetting, bounties []BountyIssue) error {
+// SendEmailNotification constructs and sends HTML email
+// SendEmailNotification constructs and sends HTML email to all registered subscribers
+func SendEmailNotification(settings UserSetting, bounties []BountyIssue, subject string, heading string, introText string) error {
 	// Build HTML Body
 	var bodyBuilder strings.Builder
 	bodyBuilder.WriteString("<html><body style=\"font-family: sans-serif; background-color: #0d0e15; color: #f5f5f7; padding: 20px;\">")
-	bodyBuilder.WriteString("<h1 style=\"color: #4d65ff; border-bottom: 2px solid #1a1c29; padding-bottom: 10px;\">Daily Bounty Digest</h1>")
-	bodyBuilder.WriteString(fmt.Sprintf("<p style=\"color: #86868b;\">We found <strong>%d</strong> new bounties matching your stack preferences today.</p><br/>", len(bounties)))
+	bodyBuilder.WriteString(fmt.Sprintf("<h1 style=\"color: #4d65ff; border-bottom: 2px solid #1a1c29; padding-bottom: 10px;\">%s</h1>", heading))
+	bodyBuilder.WriteString(fmt.Sprintf("<p style=\"color: #86868b;\">%s</p><br/>", introText))
 
 	for _, b := range bounties {
 		bodyBuilder.WriteString("<div style=\"background-color: #12131e; border: 1px solid #1f2136; border-radius: 8px; padding: 15px; margin-bottom: 15px;\">")
@@ -180,7 +278,6 @@ func SendEmailDigest(settings UserSetting, bounties []BountyIssue) error {
 	bodyBuilder.WriteString("</body></html>")
 
 	htmlBody := bodyBuilder.String()
-	subject := fmt.Sprintf("BountyHub: %d New Bounties Discovered", len(bounties))
 	
 	// Read SMTP credentials from environment with settings fallback
 	smtpHost := os.Getenv("SMTP_HOST")
@@ -205,22 +302,112 @@ func SendEmailDigest(settings UserSetting, bounties []BountyIssue) error {
 		smtpPass = settings.SMTPPass
 	}
 
-	// SMTP Auth
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-	to := []string{settings.Email}
-	msg := []byte("To: " + settings.Email + "\r\n" +
+	if smtpHost == "" {
+		return fmt.Errorf("SMTP host not configured")
+	}
+
+	// Fetch all subscribers from database
+	var subs []Subscriber
+	if err := DB.Find(&subs).Error; err != nil {
+		log.Printf("Failed to fetch subscribers: %v", err)
+	}
+
+	// Fallback to settings.Email if no database subscribers exist
+	if len(subs) == 0 {
+		if settings.Email != "" {
+			subs = append(subs, Subscriber{Email: settings.Email})
+		} else {
+			return fmt.Errorf("no subscribers set")
+		}
+	}
+
+	// Loop and send to each subscriber
+	var lastErr error
+	for _, sub := range subs {
+		log.Printf("Sending notification email to subscriber: %s", sub.Email)
+		err := sendToSingleEmail(smtpHost, smtpPort, smtpUser, smtpPass, sub.Email, subject, htmlBody)
+		if err != nil {
+			log.Printf("Failed to send email to %s: %v", sub.Email, err)
+			lastErr = err
+		}
+	}
+
+	return lastErr
+}
+
+// sendToSingleEmail handles actual SMTP connection and dispatching for one recipient
+func sendToSingleEmail(smtpHost string, smtpPort int, smtpUser string, smtpPass string, toEmail string, subject string, htmlBody string) error {
+	addr := fmt.Sprintf("%s:%d", smtpHost, smtpPort)
+	msg := []byte("To: " + toEmail + "\r\n" +
 		"Subject: " + subject + "\r\n" +
 		"MIME-version: 1.0;\nContent-Type: text/html; charset=\"UTF-8\";\r\n\r\n" +
 		htmlBody)
-	
-	addr := fmt.Sprintf("%s:%d", smtpHost, smtpPort)
-	log.Printf("Connecting to SMTP server at %s to send digest...", addr)
-	
-	err := smtp.SendMail(addr, auth, smtpUser, to, msg)
+
+	if smtpPort == 465 {
+		log.Printf("Connecting to SMTP server via SSL at %s to send to %s...", addr, toEmail)
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: false,
+			ServerName:         smtpHost,
+		}
+		
+		conn, err := tls.Dial("tcp", addr, tlsConfig)
+		if err != nil {
+			return fmt.Errorf("TLS dial failed: %w", err)
+		}
+		defer conn.Close()
+
+		client, err := smtp.NewClient(conn, smtpHost)
+		if err != nil {
+			return fmt.Errorf("SMTP client initialization failed: %w", err)
+		}
+		defer client.Close()
+
+		if smtpUser != "" && smtpPass != "" {
+			auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
+			if err = client.Auth(auth); err != nil {
+				return fmt.Errorf("SMTP auth failed: %w", err)
+			}
+		}
+
+		if err = client.Mail(smtpUser); err != nil {
+			return fmt.Errorf("SMTP MAIL command failed: %w", err)
+		}
+
+		if err = client.Rcpt(toEmail); err != nil {
+			return fmt.Errorf("SMTP RCPT command failed: %w", err)
+		}
+
+		w, err := client.Data()
+		if err != nil {
+			return fmt.Errorf("SMTP DATA command failed: %w", err)
+		}
+
+		_, err = w.Write(msg)
+		if err != nil {
+			return fmt.Errorf("writing body failed: %w", err)
+		}
+
+		err = w.Close()
+		if err != nil {
+			return fmt.Errorf("closing writer failed: %w", err)
+		}
+
+		log.Printf("Email successfully sent via SSL to %s!", toEmail)
+		return client.Quit()
+	}
+
+	// For port 587/25, use standard smtp.SendMail (uses STARTTLS if available)
+	var auth smtp.Auth
+	if smtpUser != "" && smtpPass != "" {
+		auth = smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
+	}
+
+	log.Printf("Connecting to SMTP server at %s to send to %s...", addr, toEmail)
+	err := smtp.SendMail(addr, auth, smtpUser, []string{toEmail}, msg)
 	if err != nil {
 		return err
 	}
 	
-	log.Println("Email digest successfully sent!")
+	log.Printf("Email successfully sent to %s!", toEmail)
 	return nil
 }

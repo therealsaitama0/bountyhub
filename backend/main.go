@@ -49,6 +49,10 @@ func main() {
 	r.Get("/api/dashboard", handleGetDashboardStats)
 	r.Get("/api/settings", handleGetSettings)
 	r.Post("/api/settings", handleUpdateSettings)
+	r.Post("/api/settings/test-email", handleTestEmail)
+	r.Get("/api/subscribers", handleGetSubscribers)
+	r.Post("/api/subscribers", handleAddSubscriber)
+	r.Delete("/api/subscribers/{id}", handleDeleteSubscriber)
 
 	// Configure CORS
 	corsHandler := cors.New(cors.Options{
@@ -357,6 +361,11 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	existing.SMTPPort = payload.SMTPPort
 	existing.SMTPUser = payload.SMTPUser
 	existing.SMTPPass = payload.SMTPPass
+	existing.DigestTime = payload.DigestTime
+	existing.NotificationMode = payload.NotificationMode
+	existing.SyncIntervalMins = payload.SyncIntervalMins
+	existing.QuietHoursStart = payload.QuietHoursStart
+	existing.QuietHoursEnd = payload.QuietHoursEnd
 
 	if err := DB.Save(&existing).Error; err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -364,4 +373,99 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, existing)
+}
+
+func handleTestEmail(w http.ResponseWriter, r *http.Request) {
+	var settings UserSetting
+	if err := DB.First(&settings).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if settings.Email == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Please configure a subscriber email address first."})
+		return
+	}
+
+	dummyBounties := []BountyIssue{
+		{
+			Title:              "Demo Bounty: Implement Realtime Mail Notifications",
+			RepositoryFullName: "aakaru/bountyhub",
+			ParsedAmount:       500,
+			Currency:           "USD",
+			TopicTags:          "Go,React,TypeScript",
+			HTMLURL:            "https://github.com/aakaru/bountyhub",
+		},
+	}
+
+	subject := "BountyHub Alert: SMTP Test Notification"
+	heading := "SMTP Connection Success!"
+	intro := "This is a test notification confirming that your mail settings are properly configured and working."
+
+	err := SendEmailNotification(settings, dummyBounties, subject, heading, intro)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "success", "message": "Test email sent successfully!"})
+}
+
+func handleGetSubscribers(w http.ResponseWriter, r *http.Request) {
+	var subs []Subscriber
+	if err := DB.Order("created_at DESC").Find(&subs).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, subs)
+}
+
+type SubscriberPayload struct {
+	Email string `json:"email"`
+}
+
+func handleAddSubscriber(w http.ResponseWriter, r *http.Request) {
+	var payload SubscriberPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	email := strings.TrimSpace(payload.Email)
+	if email == "" {
+		http.Error(w, "Email is required", http.StatusBadRequest)
+		return
+	}
+
+	sub := Subscriber{
+		Email:     email,
+		CreatedAt: time.Now(),
+	}
+
+	if err := DB.Create(&sub).Error; err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Email already subscribed"})
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, sub)
+}
+
+func handleDeleteSubscriber(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+
+	if err := DB.Delete(&Subscriber{}, id).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

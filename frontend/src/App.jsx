@@ -155,6 +155,16 @@ function App() {
     }
   })
 
+  // 3b. Fetch Subscribers
+  const { data: subscribers = [], refetch: refetchSubscribers } = useQuery({
+    queryKey: ['subscribers'],
+    queryFn: async () => {
+      const res = await fetch(`${API_BASE}/subscribers`)
+      if (!res.ok) throw new Error('Failed to fetch subscribers')
+      return res.json()
+    }
+  })
+
   // 4. Mutation: Save Bounty
   const saveMutation = useMutation({
     mutationFn: async (payload) => {
@@ -239,7 +249,11 @@ function App() {
     smtp_port: 587,
     smtp_user: '',
     smtp_pass: '',
-    digest_time: '09:00'
+    digest_time: '09:00',
+    notification_mode: 'both',
+    sync_interval_mins: 60,
+    quiet_hours_start: '22:00',
+    quiet_hours_end: '08:00'
   })
 
   useEffect(() => {
@@ -253,7 +267,11 @@ function App() {
         smtp_port: settings.smtp_port || 587,
         smtp_user: settings.smtp_user || '',
         smtp_pass: settings.smtp_pass || '',
-        digest_time: settings.digest_time || '09:00'
+        digest_time: settings.digest_time || '09:00',
+        notification_mode: settings.notification_mode || 'both',
+        sync_interval_mins: settings.sync_interval_mins || 60,
+        quiet_hours_start: settings.quiet_hours_start || '22:00',
+        quiet_hours_end: settings.quiet_hours_end || '08:00'
       })
     }
   }, [settings])
@@ -270,6 +288,60 @@ function App() {
     onSuccess: () => {
       queryClient.invalidateQueries(['settings'])
       alert('System Settings saved successfully!')
+    }
+  })
+
+  const [testEmailLoading, setTestEmailLoading] = useState(false)
+  const handleTestEmail = async () => {
+    setTestEmailLoading(true)
+    try {
+      const res = await fetch(`${API_BASE}/settings/test-email`, {
+        method: 'POST',
+      })
+      const data = await res.json()
+      if (res.ok) {
+        alert(data.message || 'Test email sent successfully!')
+      } else {
+        alert(data.error || 'Failed to send test email.')
+      }
+    } catch (err) {
+      alert('Network error when sending test email: ' + err.message)
+    } finally {
+      setTestEmailLoading(false)
+    }
+  }
+
+  const [newSubEmail, setNewSubEmail] = useState('')
+
+  const addSubMutation = useMutation({
+    mutationFn: async (email) => {
+      const res = await fetch(`${API_BASE}/subscribers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Failed to add subscriber')
+      return data
+    },
+    onSuccess: () => {
+      setNewSubEmail('')
+      queryClient.invalidateQueries(['subscribers'])
+    },
+    onError: (err) => {
+      alert(err.message)
+    }
+  })
+
+  const deleteSubMutation = useMutation({
+    mutationFn: async (id) => {
+      const res = await fetch(`${API_BASE}/subscribers/${id}`, {
+        method: 'DELETE'
+      })
+      return res.json()
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['subscribers'])
     }
   })
 
@@ -729,6 +801,24 @@ function App() {
               </h1>
             </div>
 
+            {settings?.last_synced_at && (
+              <div style={{
+                marginBottom: '1.5rem',
+                fontSize: '0.85rem',
+                color: '#86868b',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                backgroundColor: 'rgba(255, 255, 255, 0.03)',
+                padding: '0.5rem 1rem',
+                borderRadius: '6px',
+                border: '1px solid rgba(255, 255, 255, 0.05)'
+              }}>
+                <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#10b981', display: 'inline-block' }}></span>
+                Last checked for new GitHub bounties: {new Date(settings.last_synced_at).toLocaleString()}
+              </div>
+            )}
+
             <div className="settings-panel">
               <form onSubmit={handleSettingsSubmit}>
                 
@@ -746,10 +836,10 @@ function App() {
                   <span className="form-hint">Used server-side to fetch bounty issues and bypass standard GitHub API rate limits. Requires public_repo access.</span>
                 </div>
 
-                <h3 style={{ fontFamily: 'var(--font-display)', margin: '2.5rem 0 1.5rem 0', color: '#fff', borderBottom: '1px solid rgba(255,255,255,0.04)', paddingBottom: '0.5rem' }}>Digest Preferences</h3>
+                <h3 style={{ fontFamily: 'var(--font-display)', margin: '2.5rem 0 1.5rem 0', color: '#fff', borderBottom: '1px solid rgba(255,255,255,0.04)', paddingBottom: '0.5rem' }}>Notification Settings</h3>
 
                 <div className="form-group">
-                  <label className="form-label">Subscriber Email</label>
+                  <label className="form-label">Fallback Subscriber Email</label>
                   <input 
                     type="email" 
                     className="form-input" 
@@ -757,8 +847,136 @@ function App() {
                     onChange={(e) => setFormSettings({ ...formSettings, email: e.target.value })}
                     placeholder="your-email@gmail.com"
                   />
-                  <span className="form-hint">Receiver address for the daily 24h cron digest.</span>
+                  <span className="form-hint">Receiver address if no team subscribers are added.</span>
                 </div>
+
+                <div className="form-group" style={{ marginTop: '2rem' }}>
+                  <label className="form-label" style={{ color: 'var(--color-electric-mint)' }}>Add Team Subscriber</label>
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <input 
+                      type="email" 
+                      className="form-input" 
+                      value={newSubEmail}
+                      onChange={(e) => setNewSubEmail(e.target.value)}
+                      placeholder="team-member@company.com"
+                      style={{ flex: 1 }}
+                    />
+                    <button 
+                      type="button" 
+                      className="rolling-btn" 
+                      onClick={() => {
+                        if (newSubEmail.trim()) {
+                          addSubMutation.mutate(newSubEmail.trim());
+                        }
+                      }}
+                      style={{ height: '46px', borderRadius: '8px' }}
+                    >
+                      <span className="rolling-btn-text" data-text="Add Email">Add Email</span>
+                    </button>
+                  </div>
+                  <span className="form-hint">Enter a team member's email address to add them to the email list.</span>
+                </div>
+
+                {subscribers.length > 0 && (
+                  <div style={{
+                    marginTop: '1.5rem',
+                    marginBottom: '2rem',
+                    backgroundColor: 'rgba(255, 255, 255, 0.02)',
+                    border: '1px solid rgba(255, 255, 255, 0.05)',
+                    borderRadius: '8px',
+                    padding: '1rem'
+                  }}>
+                    <h4 style={{ color: 'rgba(255,255,255,0.6)', fontSize: '0.85rem', marginBottom: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Active Team Subscribers ({subscribers.length})</h4>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                      {subscribers.map((sub) => (
+                        <div key={sub.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.5rem 0.75rem', backgroundColor: 'rgba(0,0,0,0.2)', borderRadius: '4px' }}>
+                          <span style={{ fontSize: '0.9rem', color: '#f5f5f7' }}>{sub.email}</span>
+                          <button 
+                            type="button" 
+                            onClick={() => deleteSubMutation.mutate(sub.id)}
+                            style={{ background: 'transparent', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '1.1rem', fontWeight: 'bold' }}
+                            title="Remove subscriber"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="form-group">
+                  <label className="form-label">Notification Mode</label>
+                  <select
+                    className="form-input"
+                    value={formSettings.notification_mode}
+                    onChange={(e) => setFormSettings({ ...formSettings, notification_mode: e.target.value })}
+                    style={{ background: '#0d0e15', cursor: 'pointer' }}
+                  >
+                    <option value="both">Both (Real-time Alerts & Daily Digest)</option>
+                    <option value="instant">Real-time Email Alerts Only</option>
+                    <option value="digest">Daily Digest Email Only</option>
+                  </select>
+                  <span className="form-hint">How and when you want to receive emails about new matching bounties.</span>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Bounty Checking Frequency</label>
+                  <select
+                    className="form-input"
+                    value={formSettings.sync_interval_mins}
+                    onChange={(e) => setFormSettings({ ...formSettings, sync_interval_mins: parseInt(e.target.value) || 60 })}
+                    style={{ background: '#0d0e15', cursor: 'pointer' }}
+                  >
+                    <option value="15">Every 15 Minutes</option>
+                    <option value="30">Every 30 Minutes</option>
+                    <option value="60">Every Hour</option>
+                    <option value="180">Every 3 Hours</option>
+                    <option value="360">Every 6 Hours</option>
+                    <option value="720">Every 12 Hours</option>
+                    <option value="1440">Every 24 Hours</option>
+                  </select>
+                  <span className="form-hint">How often the system queries GitHub to discover new matching bounty opportunities.</span>
+                </div>
+
+                {(formSettings.notification_mode === 'instant' || formSettings.notification_mode === 'both') && (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                    <div className="form-group">
+                      <label className="form-label">Quiet Hours Start</label>
+                      <input 
+                        type="time" 
+                        className="form-input" 
+                        value={formSettings.quiet_hours_start}
+                        onChange={(e) => setFormSettings({ ...formSettings, quiet_hours_start: e.target.value })}
+                      />
+                      <span className="form-hint">Do not send instant alerts starting at this time.</span>
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Quiet Hours End</label>
+                      <input 
+                        type="time" 
+                        className="form-input" 
+                        value={formSettings.quiet_hours_end}
+                        onChange={(e) => setFormSettings({ ...formSettings, quiet_hours_end: e.target.value })}
+                      />
+                      <span className="form-hint">Resume sending instant alerts after this time.</span>
+                    </div>
+                  </div>
+                )}
+
+                {(formSettings.notification_mode === 'digest' || formSettings.notification_mode === 'both') && (
+                  <div className="form-group">
+                    <label className="form-label">Digest Scheduled Time</label>
+                    <input 
+                      type="time" 
+                      className="form-input" 
+                      value={formSettings.digest_time}
+                      onChange={(e) => setFormSettings({ ...formSettings, digest_time: e.target.value })}
+                    />
+                    <span className="form-hint">Choose the time (24h format) to trigger your daily digest email.</span>
+                  </div>
+                )}
 
                 <div className="form-group">
                   <label className="form-label">Min Bounty Amount Threshold</label>
@@ -768,7 +986,7 @@ function App() {
                     value={formSettings.min_bounty_amount}
                     onChange={(e) => setFormSettings({ ...formSettings, min_bounty_amount: parseFloat(e.target.value) || 0 })}
                   />
-                  <span className="form-hint">Only issues exceeding this parsed amount will be summarized in the daily digest.</span>
+                  <span className="form-hint">Only issues exceeding this parsed amount will be summarized or notified.</span>
                 </div>
 
                 <div className="form-group">
@@ -780,21 +998,75 @@ function App() {
                     onChange={(e) => setFormSettings({ ...formSettings, filter_languages: e.target.value })}
                     placeholder="Go,Rust,TypeScript,AI"
                   />
-                  <span className="form-hint">Filter tags for digest aggregation. Case-insensitive.</span>
+                  <span className="form-hint">Filter tags for digest/alert matching. Case-insensitive.</span>
+                </div>
+
+                <h3 style={{ fontFamily: 'var(--font-display)', margin: '2.5rem 0 1.5rem 0', color: '#fff', borderBottom: '1px solid rgba(255,255,255,0.04)', paddingBottom: '0.5rem' }}>SMTP Mail Server</h3>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '3fr 1fr', gap: '1rem' }}>
+                  <div className="form-group">
+                    <label className="form-label">SMTP Host</label>
+                    <input 
+                      type="text" 
+                      className="form-input" 
+                      value={formSettings.smtp_host}
+                      onChange={(e) => setFormSettings({ ...formSettings, smtp_host: e.target.value })}
+                      placeholder="smtp.gmail.com"
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">SMTP Port</label>
+                    <input 
+                      type="number" 
+                      className="form-input" 
+                      value={formSettings.smtp_port}
+                      onChange={(e) => setFormSettings({ ...formSettings, smtp_port: parseInt(e.target.value) || 587 })}
+                      placeholder="587"
+                    />
+                  </div>
                 </div>
 
                 <div className="form-group">
-                  <label className="form-label">Digest Scheduled Time</label>
+                  <label className="form-label">SMTP Username</label>
                   <input 
-                    type="time" 
+                    type="text" 
                     className="form-input" 
-                    value={formSettings.digest_time}
-                    onChange={(e) => setFormSettings({ ...formSettings, digest_time: e.target.value })}
+                    value={formSettings.smtp_user}
+                    onChange={(e) => setFormSettings({ ...formSettings, smtp_user: e.target.value })}
+                    placeholder="your-email@gmail.com"
                   />
-                  <span className="form-hint">Choose the time (24h format) to trigger your daily digest email.</span>
                 </div>
 
-                <div className="settings-btn-row">
+                <div className="form-group">
+                  <label className="form-label">SMTP Password</label>
+                  <input 
+                    type="password" 
+                    className="form-input" 
+                    value={formSettings.smtp_pass}
+                    onChange={(e) => setFormSettings({ ...formSettings, smtp_pass: e.target.value })}
+                    placeholder="••••••••••••••••"
+                  />
+                  <span className="form-hint">Provide an App Password if using Gmail. Do not share your primary account password.</span>
+                </div>
+
+                <div className="settings-btn-row" style={{ display: 'flex', gap: '1rem', marginTop: '2.5rem' }}>
+                  <button 
+                    type="button" 
+                    className="rolling-btn" 
+                    onClick={handleTestEmail}
+                    disabled={testEmailLoading}
+                    style={{
+                      backgroundColor: 'transparent',
+                      borderColor: 'rgba(255,255,255,0.15)',
+                      color: 'var(--color-paper-white)'
+                    }}
+                  >
+                    <span className="rolling-btn-text" data-text={testEmailLoading ? "Sending..." : "Test SMTP Config"}>
+                      {testEmailLoading ? "Sending..." : "Test SMTP Config"}
+                    </span>
+                  </button>
+
                   <button type="submit" className="rolling-btn">
                     <span className="rolling-btn-text" data-text="Save Configuration">
                       Save Settings

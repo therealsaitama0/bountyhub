@@ -1,8 +1,10 @@
 package main
 
 import (
+	"os"
 	"time"
 
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -50,21 +52,37 @@ type EarningsRecord struct {
 }
 
 type UserSetting struct {
-	ID              uint    `gorm:"primaryKey" json:"id"`
-	GithubToken     string  `json:"github_token"`
-	Email           string  `json:"email"`
-	MinBountyAmount float64 `json:"min_bounty_amount"`
-	FilterLanguages string  `json:"filter_languages"` // Comma-separated: "Go,Rust,TypeScript"
-	SMTPHost        string  `json:"smtp_host"`
-	SMTPPort        int     `json:"smtp_port"`
-	SMTPUser        string  `json:"smtp_user"`
-	SMTPPass        string  `json:"smtp_pass"`
-	DigestTime      string  `json:"digest_time"` // "09:00", etc.
+	ID               uint      `gorm:"primaryKey" json:"id"`
+	GithubToken      string    `json:"github_token"`
+	Email            string    `json:"email"`
+	MinBountyAmount  float64   `json:"min_bounty_amount"`
+	FilterLanguages  string    `json:"filter_languages"` // Comma-separated: "Go,Rust,TypeScript"
+	SMTPHost         string    `json:"smtp_host"`
+	SMTPPort         int       `json:"smtp_port"`
+	SMTPUser         string    `json:"smtp_user"`
+	SMTPPass         string    `json:"smtp_pass"`
+	DigestTime       string    `json:"digest_time"`        // "09:00"
+	NotificationMode string    `json:"notification_mode"` // "instant", "digest", "both"
+	SyncIntervalMins int       `json:"sync_interval_mins"` // e.g. 30, 60, 120
+	QuietHoursStart  string    `json:"quiet_hours_start"` // "22:00"
+	QuietHoursEnd    string    `json:"quiet_hours_end"`   // "08:00"
+	LastSyncedAt     time.Time `json:"last_synced_at"`
+}
+
+type Subscriber struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Email     string    `gorm:"uniqueIndex" json:"email"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func InitDB(dbPath string) error {
 	var err error
-	DB, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL != "" {
+		DB, err = gorm.Open(postgres.Open(dbURL), &gorm.Config{})
+	} else {
+		DB, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	}
 	if err != nil {
 		return err
 	}
@@ -76,6 +94,7 @@ func InitDB(dbPath string) error {
 		&BountyProgress{},
 		&EarningsRecord{},
 		&UserSetting{},
+		&Subscriber{},
 	)
 	if err != nil {
 		return err
@@ -86,11 +105,28 @@ func InitDB(dbPath string) error {
 	DB.Model(&UserSetting{}).Count(&count)
 	if count == 0 {
 		defaultSettings := UserSetting{
-			MinBountyAmount: 0.0,
-			FilterLanguages: "Go,Rust,TypeScript,Python",
-			DigestTime:      "09:00",
+			MinBountyAmount:  0.0,
+			FilterLanguages:  "Go,Rust,TypeScript,Python",
+			DigestTime:       "09:00",
+			NotificationMode: "both",
+			SyncIntervalMins: 60,
+			QuietHoursStart:  "22:00",
+			QuietHoursEnd:    "08:00",
 		}
 		DB.Create(&defaultSettings)
+	}
+
+	// Seed subscribers table with existing settings email if empty
+	var subCount int64
+	DB.Model(&Subscriber{}).Count(&subCount)
+	if subCount == 0 {
+		var settings UserSetting
+		if err := DB.First(&settings).Error; err == nil && settings.Email != "" {
+			DB.Create(&Subscriber{
+				Email:     settings.Email,
+				CreatedAt: time.Now(),
+			})
+		}
 	}
 
 	return nil
